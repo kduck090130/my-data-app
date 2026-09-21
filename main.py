@@ -17,22 +17,27 @@ API_URL = "https://www.kobis.or.kr/kobisopenapi/webservice/rest/boxoffice/search
 KST = ZoneInfo("Asia/Seoul")          # 'Asia/Seoul' = 한국 표준시
 
 # 페이지 기본 설정(제목, 아이콘, 넓은 레이아웃). 반드시 다른 st 명령보다 먼저 호출합니다.
-st.set_page_config(page_title="어제의 박스오피스", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="일별 박스오피스", page_icon="🎬", layout="wide")
 
 
 # ─────────────────────────────────────────────────────────────
 # 1) 날짜 계산: '어제'를 한국 시간 기준으로 구하기
 # ─────────────────────────────────────────────────────────────
-def get_yesterday_kst() -> str:
-    """한국 시간 기준 '어제' 날짜를 'yyyymmdd' 여덟 자리 문자열로 돌려줍니다.
+def get_yesterday_date_kst() -> dt.date:
+    """한국 시간 기준 '어제' 날짜를 date 객체로 돌려줍니다.
 
     배포 서버(스트림릿 클라우드)의 시계는 보통 UTC라서
     그냥 datetime.now() 를 쓰면 한국과 날짜가 하루 어긋날 수 있습니다.
     그래서 항상 KST(한국 시간)로 '지금'을 구한 뒤 하루를 뺍니다.
+    달력 위젯(st.date_input)이 요구하는 값도 바로 이 date 객체입니다.
     """
     now_kst = dt.datetime.now(KST)            # 지금 시각(한국 기준)
-    yesterday = now_kst - dt.timedelta(days=1)  # 하루 빼기
-    return yesterday.strftime("%Y%m%d")       # 예: 20260916
+    return (now_kst - dt.timedelta(days=1)).date()  # 하루 빼고 date만 뽑기
+
+
+def date_to_yyyymmdd(d: dt.date) -> str:
+    """date 객체를 KOBIS가 요구하는 'yyyymmdd' 여덟 자리 문자열로 바꿔 줍니다."""
+    return d.strftime("%Y%m%d")
 
 
 def to_pretty_date(yyyymmdd: str) -> str:
@@ -146,13 +151,13 @@ def show_error_help(result: dict, target_dt: str) -> None:
             st.caption(f"KOBIS가 알려 준 내용: {detail}")
 
     elif reason == "empty":
-        st.warning(f"{to_pretty_date(target_dt)} 의 박스오피스 목록이 비어 있습니다.")
+        st.warning(f"📅 {to_pretty_date(target_dt)} — 그날은 아직 집계 전입니다.")
         st.markdown(
             """
             **이럴 때가 많습니다**
-            1. 집계가 아직 끝나지 않은 시각입니다. 보통 **오전 중**에 전날 자료가 올라옵니다.
+            1. 오늘이나 바로 전날 자료는 KOBIS가 보통 **오전 중**에 집계를 끝냅니다.
                잠시 뒤 아래 **새로고침** 버튼을 눌러 보세요.
-            2. 조회 날짜가 **너무 과거이거나 미래**일 수 있습니다.
+            2. 아주 오래전 날짜는 KOBIS 쪽에 자료가 없을 수도 있습니다.
             3. KOBIS 쪽에서 일시적으로 자료를 내려놨을 수 있습니다.
             """
         )
@@ -183,10 +188,20 @@ def show_error_help(result: dict, target_dt: str) -> None:
 # ─────────────────────────────────────────────────────────────
 # 6) 실제 화면 그리기 (여기서부터 위에서 만든 함수들을 사용합니다)
 # ─────────────────────────────────────────────────────────────
-st.title("🎬 어제의 박스오피스")
+st.title("🎬 일별 박스오피스")
 
-target_dt = get_yesterday_kst()   # 한국 시간 기준 어제
-st.caption(f"조회 기준일: **{to_pretty_date(target_dt)}** (한국 시간 기준 어제) · "
+yesterday_kst = get_yesterday_date_kst()   # 한국 시간 기준 '어제' (달력에서 고를 수 있는 가장 늦은 날짜)
+
+# 달력 위젯: 오늘 것은 아직 집계 전이므로 max_value 를 '어제'로 막아 둡니다.
+# 기본으로 선택돼 있는 날짜도 '어제'로 맞춰 둡니다.
+selected_date = st.date_input(
+    "조회할 날짜를 고르세요 (오늘 자료는 아직 집계 전이라 고를 수 없습니다)",
+    value=yesterday_kst,
+    max_value=yesterday_kst,
+)
+
+target_dt = date_to_yyyymmdd(selected_date)   # 'yyyymmdd' 문자열로 변환
+st.caption(f"조회 기준일: **{to_pretty_date(target_dt)}** · "
            "같은 날짜는 1시간 동안 저장된 결과를 사용합니다.")
 
 # 인증키 읽어오기 — 없으면 앱을 더 진행하지 않고 안내만 보여 줍니다.
@@ -247,19 +262,58 @@ st.divider()
 # ── 전체 표 ────────────────────────────────────────────────
 st.subheader("📋 전체 순위표")
 
-# 요청한 열만 골라서 보여 줍니다. 숫자 열이라 표 머리글을 눌러 정렬할 수 있습니다.
-table_df = df[["순위", "영화명", "개봉일", "관객수", "누적관객", "스크린수"]]
+# 필요한 열만 골라 복사본을 만듭니다. (원본 df 는 그대로 두고 표시용만 따로 만듭니다)
+table_df = df[["순위", "영화명", "개봉일", "관객수", "누적관객", "스크린수", "순위증감"]].copy()
+
+# ── 순위 증감 화살표 붙이기 ──────────────────────────────────
+# rankInten(순위증감) 이 양수면 전날보다 순위가 오른 것 → 빨간 ▲
+#                      음수면 전날보다 순위가 내린 것 → 파란 ▼
+#                      0이면 순위 변동 없음 → '-'
+def rank_with_arrow(row) -> str:
+    if row["순위증감"] > 0:
+        return f"{row['순위']}위 ▲"
+    elif row["순위증감"] < 0:
+        return f"{row['순위']}위 ▼"
+    else:
+        return f"{row['순위']}위 -"
+
+table_df["순위"] = table_df.apply(rank_with_arrow, axis=1)
+
+# ── 누적관객 100만 명 넘으면 트로피 붙이기 ──────────────────
+table_df["영화명"] = table_df.apply(
+    lambda row: f"🏆 {row['영화명']}" if row["누적관객"] >= 1_000_000 else row["영화명"],
+    axis=1,
+)
+
+# 화면에 보여줄 최종 열만 남깁니다. (색칠 기준으로 쓴 '순위증감'은 여기서 뺍니다)
+display_df = table_df[["순위", "영화명", "개봉일", "관객수", "누적관객", "스크린수"]]
+
+
+# ── 색칠하기: 순위 셀을 오르면 빨강, 내리면 파랑으로 ────────
+def style_rank_cell(row):
+    """행 하나(row)를 받아서, 같은 자리(index)의 순위증감 부호를 보고
+    '순위' 칸에만 색깔 스타일 문자열을 넣어 줍니다. 나머지 칸은 스타일 없음('')."""
+    change = table_df.loc[row.name, "순위증감"]  # row.name = 원래 줄 번호(index)
+    styles = [""] * len(row)
+    if change > 0:
+        styles[0] = "color: red; font-weight: bold;"     # 순위 상승
+    elif change < 0:
+        styles[0] = "color: blue; font-weight: bold;"    # 순위 하락
+    return styles
+
+
+styled_table = display_df.style.apply(style_rank_cell, axis=1)
 
 st.dataframe(
-    table_df,
+    styled_table,
     hide_index=True,          # 왼쪽 줄 번호 숨기기
     use_container_width=True, # 화면 너비에 맞추기
     column_config={
-        "순위": st.column_config.NumberColumn("순위", format="%d"),
         "관객수": st.column_config.NumberColumn("관객수", format="%d"),
         "누적관객": st.column_config.NumberColumn("누적관객", format="%d"),
         "스크린수": st.column_config.NumberColumn("스크린수", format="%d"),
     },
 )
+st.caption("▲ 빨강 = 전날보다 순위 상승 · ▼ 파랑 = 전날보다 순위 하락 · 🏆 = 누적관객 100만 명 이상")
 
 st.caption("자료 출처: 영화진흥위원회(KOBIS) 오픈 API")
